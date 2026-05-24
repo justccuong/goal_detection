@@ -26,8 +26,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "web/backend/temp_uploads"
-OUTPUT_DIR = "web/backend/temp_outputs"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, "temp_uploads")
+OUTPUT_DIR = os.path.join(BASE_DIR, "temp_outputs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -35,14 +36,14 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 jobs = {}
 
 # Load custom YOLOv8 model for ball and goalpost detection
-MODEL_PATH = "e:/_FPT_UNI_/Smartlab/web/best.pt"
+MODEL_PATH = os.path.join(BASE_DIR, "best.pt")
 try:
     model = YOLO(MODEL_PATH)
     print(f"Successfully loaded custom model from {MODEL_PATH}")
 except Exception as e:
     print(f"Failed to load custom model from {MODEL_PATH}, trying local fallback...")
-    if os.path.exists("web/best.pt"):
-        model = YOLO("web/best.pt")
+    if os.path.exists(os.path.join(BASE_DIR, "best.pt")):
+        model = YOLO(os.path.join(BASE_DIR, "best.pt"))
     elif os.path.exists("best.pt"):
         model = YOLO("best.pt")
     else:
