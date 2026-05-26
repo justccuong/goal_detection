@@ -514,17 +514,18 @@ function App() {
       }
       
       const blob = await response.blob();
+      const isZip = blob.type === 'application/zip';
       const url = window.URL.createObjectURL(blob);
       
       const a = document.createElement("a");
       a.href = url;
-      a.download = "football_highlights.mp4";
+      a.download = isZip ? "football_highlights.zip" : "football_highlights.mp4";
       document.body.appendChild(a);
       a.click();
       a.remove();
       
       setIsExporting(false);
-      addLog("FFmpeg highlight reel compilation complete! Video downloaded.", "success");
+      addLog(isZip ? "FFmpeg highlight segments compilation complete! ZIP downloaded." : "FFmpeg highlight reel compilation complete! Video downloaded.", "success");
       
       // Auto download report file
       downloadReportFile(selectedClips);

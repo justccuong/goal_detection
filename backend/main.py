@@ -1,5 +1,6 @@
 import io
 import os
+import zipfile
 import cv2
 import numpy as np
 import base64
@@ -441,38 +442,36 @@ async def export_video(payload: ExportPayload):
                 
             clip_files.append(clip_path)
             
-        output_filename = f"highlight_{export_id}.mp4"
-        output_path = os.path.join(export_subfolder, output_filename)
-        
         if len(clip_files) == 1:
+            output_filename = f"highlight_{export_id}.mp4"
+            output_path = os.path.join(export_subfolder, output_filename)
             shutil.copy2(clip_files[0], output_path)
-        else:
-            list_path = os.path.join(export_subfolder, "list.txt")
-            with open(list_path, "w") as f:
-                for clip in clip_files:
-                    f.write(f"file '{os.path.basename(clip)}'\n")
-                    
-            concat_cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", list_path,
-                "-c", "copy",
-                output_path
-            ]
             
-            concat_result = subprocess.run(concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if concat_result.returncode != 0:
-                raise Exception(f"Failed to concatenate segments: {concat_result.stderr}")
+            if not os.path.exists(output_path):
+                raise Exception("Exported file was not created successfully")
                 
-        if not os.path.exists(output_path):
-            raise Exception("Exported file was not created successfully")
+            return FileResponse(
+                path=output_path,
+                media_type="video/mp4",
+                filename="smartplay_highlights.mp4"
+            )
+        else:
+            zip_filename = f"highlights_{export_id}.zip"
+            zip_path = os.path.join(export_subfolder, zip_filename)
             
-        return FileResponse(
-            path=output_path,
-            media_type="video/mp4",
-            filename="smartplay_highlights.mp4"
-        )
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for idx, clip in enumerate(clip_files):
+                    arcname = f"highlight_{idx + 1}.mp4"
+                    zipf.write(clip, arcname)
+                    
+            if not os.path.exists(zip_path):
+                raise Exception("Exported ZIP file was not created successfully")
+                
+            return FileResponse(
+                path=zip_path,
+                media_type="application/zip",
+                filename="smartplay_highlights.zip"
+            )
     except Exception as e:
         import traceback
         traceback.print_exc()
