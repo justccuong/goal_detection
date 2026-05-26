@@ -922,3 +922,138 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* CUSTOM VIDEO PLAYER STYLES */
+.video-player-container {
+  position: relative;
+  overflow: hidden;
+}
+
+.custom-player-controls {
+  background: rgba(10, 10, 20, 0.95);
+  border-top: 1px solid var(--color-border);
+  box-shadow: 0 -4px 10px rgba(0, 0, 0, 0.3);
+  z-index: 10;
+}
+
+.control-btn {
+  transition: all var(--transition-fast) !important;
+}
+
+.control-btn:hover {
+  color: var(--secondary) !important;
+  transform: scale(1.1);
+}
+
+.player-scrubber {
+  -webkit-appearance: none;
+  appearance: none;
+  border-radius: 2px;
+  outline: none;
+  transition: background 0.3s;
+}
+
+.player-scrubber::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--secondary);
+  box-shadow: 0 0 6px var(--secondary-glow);
+  cursor: pointer;
+  transition: transform 0.1s;
+}
+
+.player-scrubber::-webkit-slider-thumb:hover {
+  transform: scale(1.3);
+}
+
+.player-scrubber::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: none;
+  border-radius: 50%;
+  background: var(--secondary);
+  box-shadow: 0 0 6px var(--secondary-glow);
+  cursor: pointer;
+  transition: transform 0.1s;
+}
+
+.player-scrubber::-moz-range-thumb:hover {
+  transform: scale(1.3);
+}
+
+/* STATISTICS DASHBOARD */
+.stats-dashboard {
+  animation: fadeIn 0.4s ease-out;
+}
+
+.stats-dash-card {
+  transition: all var(--transition-normal);
+}
+
+.stats-dash-card:hover {
+  background: rgba(255, 255, 255, 0.04) !important;
+}
+
+/* ACTUAL GOALS INPUT */
+.actual-goals-input {
+  width: 50px;
+  background: rgba(2, 2, 5, 0.6);
+  border: 1px solid var(--color-border);
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: bold;
+  padding: 4px 6px;
+  text-align: center;
+  border-radius: 4px;
+  outline: none;
+  transition: all var(--transition-fast);
+}
+
+.actual-goals-input:focus {
+  border-color: var(--secondary);
+  box-shadow: 0 0 6px var(--secondary-glow);
+}
+
+/* Hide spin-buttons for actual goals input number */
+.actual-goals-input::-webkit-outer-spin-button,
+.actual-goals-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.actual-goals-input {
+  -moz-appearance: textfield;
+}
+
+.stats-dash-input-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.stats-comparison-badge {
+  font-size: 0.65rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: bold;
+  text-transform: uppercase;
+  margin-top: 4px;
+  display: inline-block;
+}
+
+.stats-comparison-badge.match {
+  background: rgba(34, 197, 94, 0.15);
+  color: #22c55e;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.stats-comparison-badge.mismatch {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+

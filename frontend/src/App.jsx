@@ -82,6 +82,74 @@ function App() {
   const [scanProgress, setScanProgress] = useState(0);
   const [videoIntervals, setVideoIntervals] = useState([]);
   const [isExporting, setIsExporting] = useState(false);
+  const [actualGoals, setActualGoals] = useState(0);
+
+  // Custom Video Player & Playback Range Bounding States
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [videoCurrentTime, setVideoCurrentTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
+  const [activePlayInterval, setActivePlayInterval] = useState(null); // { start, end }
+
+  const formatTime = (secs) => {
+    if (isNaN(secs)) return "00:00";
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return `${m < 10 ? '0' + m : m}:${s < 10 ? '0' + s : s}`;
+  };
+
+  const togglePlay = () => {
+    if (!videoRef.current) return;
+    if (isPlaying) {
+      videoRef.current.pause();
+    } else {
+      videoRef.current.play().catch(e => console.warn("Playback blocked", e));
+    }
+  };
+
+  const stopVideo = () => {
+    if (!videoRef.current) return;
+    videoRef.current.pause();
+    videoRef.current.currentTime = 0;
+    setActivePlayInterval(null);
+  };
+
+  const handleScrubberChange = (e) => {
+    const newTime = parseFloat(e.target.value);
+    if (videoRef.current) {
+      videoRef.current.currentTime = newTime;
+      setVideoCurrentTime(newTime);
+      setActivePlayInterval(null); // Stop segment preview if user seeks
+    }
+  };
+
+  const handlePlayShort = (start, end) => {
+    if (videoRef.current) {
+      videoRef.current.currentTime = start;
+      setActivePlayInterval({ start, end });
+      videoRef.current.play().catch(e => console.warn("Playback blocked", e));
+      addLog(`Playing segment review: ${start}s to ${end}s`, "info");
+    }
+  };
+
+  const handleTimeUpdate = () => {
+    if (!videoRef.current) return;
+    const currentTime = videoRef.current.currentTime;
+    setVideoCurrentTime(currentTime);
+
+    if (activePlayInterval) {
+      if (currentTime >= activePlayInterval.end) {
+        videoRef.current.pause();
+        setActivePlayInterval(null);
+        addLog(`Reached end of segment at ${activePlayInterval.end}s. Stopped playback.`, "info");
+      }
+    }
+  };
+
+  const handleLoadedMetadata = () => {
+    if (videoRef.current) {
+      setVideoDuration(videoRef.current.duration);
+    }
+  };
 
   // SVG click explanation state
   const [selectedNode, setSelectedNode] = useState(null);
@@ -190,7 +258,9 @@ function App() {
         setPreviewUrl(null);
         setVideoUrl(URL.createObjectURL(file));
         setScanResult(null);
-        uploadAndScanVideo(file);
+        setVideoIntervals([]);
+        setActualGoals(0);
+        addLog(`Video loaded: ${file.name}. Click 'ANALYZE MATCH EVENT' to begin scanning.`);
       } else {
         setErrorMsg("Error: Please drop a valid image or MP4 video file.");
       }
@@ -214,7 +284,9 @@ function App() {
         setPreviewUrl(null);
         setVideoUrl(URL.createObjectURL(file));
         setScanResult(null);
-        uploadAndScanVideo(file);
+        setVideoIntervals([]);
+        setActualGoals(0);
+        addLog(`Video selected: ${file.name}. Click 'ANALYZE MATCH EVENT' to begin scanning.`);
       } else {
         setErrorMsg("Error: Please select a valid image or MP4 video file.");
       }
@@ -246,8 +318,12 @@ function App() {
 
   const triggerScan = async () => {
     if (!selectedFile) return;
-    setIsScanning(true);
-    await uploadAndScan(selectedFile);
+    if (uploadType === 'video') {
+      await uploadAndScanVideo(selectedFile);
+    } else {
+      setIsScanning(true);
+      await uploadAndScan(selectedFile);
+    }
   };
 
   const uploadAndScan = async (file) => {
@@ -285,6 +361,7 @@ function App() {
     setIsScanningVideo(true);
     setScanProgress(0);
     setVideoIntervals([]);
+    setActualGoals(0);
     addLog(`Uploading video file: ${file.name} for highlight analysis...`, "system");
     
     const formData = new FormData();
@@ -333,8 +410,16 @@ function App() {
           setScanProgress(1.0);
           setIsScanningVideo(false);
           
-          const mappedIntervals = data.intervals.map(inter => ({ ...inter, keep: true }));
+          const mappedIntervals = data.intervals.map(inter => ({ 
+            ...inter, 
+            keep: true,
+            correct: true,
+            isGoal: inter.type === 'GOAL'
+          }));
           setVideoIntervals(mappedIntervals);
+          const predictedGoalsCount = data.intervals.filter(c => c.type === 'GOAL').length;
+          setActualGoals(predictedGoalsCount);
+          setVideoUrl(`http://localhost:8000/api/video/${job_id}`);
           addLog(`Video scanning finished. Extracted ${mappedIntervals.length} soccer highlight clips!`, "success");
           if (mappedIntervals.length > 0) {
             playAlert("GOAL");
@@ -357,6 +442,49 @@ function App() {
     if (videoRef.current) {
       videoRef.current.currentTime = time;
       videoRef.current.play().catch(e => console.warn("Autoplay prevented", e));
+    }
+  };
+
+  const downloadReportFile = (selectedClips) => {
+    try {
+      const fileName = selectedFile?.name || "match_video.mp4";
+      const totalClips = videoIntervals.length;
+      const correctClips = videoIntervals.filter(c => c.correct).length;
+      const accuracyRate = totalClips > 0 ? Math.round((correctClips / totalClips) * 100) : 0;
+      const aiGoals = videoIntervals.filter(c => c.type === 'GOAL').length;
+
+      let mdContent = `# BÁO CÁO PHÂN TÍCH HIGHLIGHT TRẬN ĐẤU\n\n`;
+      mdContent += `* **Tên Video Gốc:** ${fileName}\n`;
+      mdContent += `* **Mã Tiến Trình (Job ID):** ${jobId || "N/A"}\n`;
+      mdContent += `* **Thời Gian Xuất Báo Cáo:** ${new Date().toLocaleString('vi-VN')}\n`;
+      mdContent += `\n## 📊 THỐNG KÊ HIỆU SUẤT MÔ HÌNH\n\n`;
+      mdContent += `* **Số bàn thắng thực tế (Người dùng xác nhận):** ${actualGoals}\n`;
+      mdContent += `* **Số bàn thắng dự đoán (AI nhận diện):** ${aiGoals}\n`;
+      mdContent += `* **Số phân cảnh AI dự đoán đúng:** ${correctClips}/${totalClips} phân cảnh\n`;
+      mdContent += `* **Độ chính xác của AI:** ${accuracyRate}%\n`;
+      mdContent += `\n## 🎞 CHI TIẾT CÁC PHÂN CẢNH ĐÃ XUẤT HIGHLIGHT\n\n`;
+      mdContent += `| Phân cảnh | Trim (Bắt đầu - Kết thúc) | Nhãn AI | Độ tin cậy (AI Conf) | Đánh giá của Bạn | Xác nhận Bàn thắng | Nội dung chi tiết |\n`;
+      mdContent += `| :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n`;
+
+      selectedClips.forEach((clip) => {
+        mdContent += `| #${clip.id + 1} | ${clip.start}s - ${clip.end}s | ${clip.type} | ${Math.round(clip.confidence * 100)}% | ${clip.correct ? "✅ Đúng" : "❌ Sai"} | ${clip.isGoal ? "⚽ Có" : "❌ Không"} | ${clip.description} |\n`;
+      });
+
+      mdContent += `\n\n---\n*Báo cáo được tạo tự động bởi hệ thống SmartPlay Football Highlight Analyzer.*`;
+
+      // Trigger markdown file download
+      const blob = new Blob([mdContent], { type: 'text/markdown;charset=utf-8;' });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `smartplay_highlight_report_${jobId || "export"}.md`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      addLog("Analysis report (smartplay_highlight_report.md) downloaded.", "success");
+    } catch (e) {
+      console.error("Failed to generate report", e);
+      addLog("Failed to generate markdown report: " + e.message, "error");
     }
   };
 
@@ -397,6 +525,9 @@ function App() {
       
       setIsExporting(false);
       addLog("FFmpeg highlight reel compilation complete! Video downloaded.", "success");
+      
+      // Auto download report file
+      downloadReportFile(selectedClips);
     } catch (err) {
       addLog(`Export failed: ${err.message}`, "error");
       setErrorMsg(`FFmpeg compilation error: ${err.message}`);
@@ -480,7 +611,7 @@ function App() {
           className={`tab-btn glass-panel ${activeTab === 'scanner' ? 'active' : ''}`}
           onClick={() => setActiveTab('scanner')}
         >
-          <span className="tab-icon">👁️</span> MATCH EVENT SCANNER
+          MATCH EVENT SCANNER
         </button>
         <button 
           className={`tab-btn glass-panel ${activeTab === 'schematics' ? 'active' : ''}`}
@@ -489,13 +620,13 @@ function App() {
             addLog("Viewing system pipeline schematics...", "system");
           }}
         >
-          <span className="tab-icon">⚙️</span> PROCESSING PIPELINE
+          PROCESSING PIPELINE
         </button>
         <button 
           className={`tab-btn glass-panel ${activeTab === 'logs' ? 'active' : ''}`}
           onClick={() => setActiveTab('logs')}
         >
-          <span className="tab-icon">📟</span> MODEL SPECS
+          MODEL SPECS
         </button>
       </nav>
 
@@ -531,18 +662,61 @@ function App() {
                     )}
                   </div>
                 ) : videoUrl ? (
-                  <div className="preview-container">
-                    <video ref={videoRef} src={videoUrl} controls className="feed-img" />
+                  <div className="preview-container video-player-container" style={{ display: 'flex', flexDirection: 'column' }}>
+                    <video 
+                      ref={videoRef} 
+                      src={videoUrl} 
+                      className="feed-img" 
+                      onTimeUpdate={handleTimeUpdate}
+                      onLoadedMetadata={handleLoadedMetadata}
+                      onPlay={() => setIsPlaying(true)}
+                      onPause={() => setIsPlaying(false)}
+                      style={{ maxHeight: '270px', width: '100%' }}
+                    />
                     {isScanningVideo && (
                       <div className="scanning-overlay">
                         <div className="scanning-bar"></div>
                         <div className="scanning-text">SCANNING VIDEO FRAMES ({Math.round(scanProgress * 100)}%)...</div>
                       </div>
                     )}
+                    <div className="custom-player-controls" style={{ display: 'flex', alignItems: 'center', width: '100%', background: '#0a0a14', padding: '8px 12px', boxSizing: 'border-box', borderTop: '1px solid var(--color-border)' }}>
+                      <button className="control-btn play-pause-btn" onClick={togglePlay} style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', padding: '4px 8px' }}>
+                        {isPlaying ? (
+                          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                            <rect x="6" y="4" width="4" height="16" rx="1" />
+                            <rect x="14" y="4" width="4" height="16" rx="1" />
+                          </svg>
+                        ) : (
+                          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                            <path d="M8 5v14l11-7z" />
+                          </svg>
+                        )}
+                      </button>
+                      
+                      <button className="control-btn stop-btn" onClick={stopVideo} title="Stop playback" style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', padding: '4px 8px', marginRight: '8px' }}>
+                        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                          <rect x="4" y="4" width="16" height="16" rx="1" />
+                        </svg>
+                      </button>
+                      
+                      <input 
+                        type="range" 
+                        min={0} 
+                        max={videoDuration || 100} 
+                        step={0.1}
+                        value={videoCurrentTime} 
+                        onChange={handleScrubberChange} 
+                        className="player-scrubber"
+                        style={{ flex: 1, margin: '0 12px', cursor: 'pointer', height: '4px', background: '#27272a' }}
+                      />
+                      
+                      <div className="player-time-display" style={{ fontFamily: 'monospace', fontSize: '0.78rem', color: '#a1a1aa', minWidth: '85px', textAlign: 'right' }}>
+                        {formatTime(videoCurrentTime)} / {formatTime(videoDuration)}
+                      </div>
+                    </div>
                   </div>
                 ) : (
                   <div className="dropzone-placeholder">
-                    <span className="cloud-icon">⚽</span>
                     <p>DRAG & DROP IMAGE OR MP4 VIDEO HERE</p>
                     <span>OR CLICK TO BROWSE LOCAL ASSETS</span>
                   </div>
@@ -561,9 +735,9 @@ function App() {
                 <button 
                   className="neon-btn" 
                   onClick={triggerScan}
-                  disabled={!selectedFile || isScanning || uploadType === 'video'}
+                  disabled={!selectedFile || isScanning || isScanningVideo}
                 >
-                  {isScanning ? "SCANNING..." : "ANALYZE MATCH EVENT"}
+                  {isScanning || isScanningVideo ? "SCANNING / EXTRACTING..." : "ANALYZE MATCH EVENT / EXTRACT EVENTS"}
                 </button>
                 
                 <button 
@@ -571,7 +745,7 @@ function App() {
                   onClick={() => setAudioEnabled(!audioEnabled)}
                   title="Toggle Alert Audio"
                 >
-                  🔊 {audioEnabled ? "CHIME ON" : "CHIME MUTED"}
+                  {audioEnabled ? "CHIME ON" : "CHIME MUTED"}
                 </button>
               </div>
 
@@ -602,10 +776,43 @@ function App() {
                 <div className="threat-status-card glass-panel" style={{ flex: 1 }}>
                   <h3>SUGGESTED HIGHLIGHT CLIPS</h3>
                   
+                  {/* Statistics Display Panel */}
+                  {videoIntervals.length > 0 && !isScanningVideo && (
+                    <div className="stats-dashboard" style={{ display: 'flex', gap: '16px', marginBottom: '16px', background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                      <div className="stats-dash-card" style={{ flex: 1, textAlign: 'center' }}>
+                        <div className="stats-dash-num" style={{ fontSize: '1.4rem', fontWeight: 'bold', color: 'var(--secondary)' }}>
+                          {videoIntervals.filter(c => c.correct).length} / {videoIntervals.length}
+                        </div>
+                        <div className="stats-dash-label" style={{ fontSize: '0.65rem', color: 'var(--text-muted)', letterSpacing: '0.05em', marginTop: '4px' }}>DỰ ĐOÁN ĐÚNG</div>
+                        <div className="stats-dash-sub" style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                          Tỉ lệ: {videoIntervals.length > 0 ? Math.round((videoIntervals.filter(c => c.correct).length / videoIntervals.length) * 100) : 0}%
+                        </div>
+                      </div>
+                      <div className="stats-dash-card" style={{ flex: 1, textAlign: 'center', borderLeft: '1px solid rgba(255,255,255,0.1)' }}>
+                        <div className="stats-dash-input-container">
+                          <input 
+                            type="number" 
+                            min="0"
+                            value={actualGoals}
+                            onChange={(e) => setActualGoals(Math.max(0, parseInt(e.target.value) || 0))}
+                            className="actual-goals-input"
+                            title="Nhập số bàn thắng thực tế"
+                          />
+                        </div>
+                        <div className="stats-dash-label" style={{ fontSize: '0.65rem', color: 'var(--text-muted)', letterSpacing: '0.05em', marginTop: '4px' }}>BÀN THẮNG TRONG VIDEO</div>
+                        <div className="stats-dash-sub" style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '2px', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                          <span>Xác nhận thực tế</span>
+                          <span className={`stats-comparison-badge ${actualGoals === videoIntervals.filter(c => c.type === 'GOAL').length ? 'match' : 'mismatch'}`}>
+                            {actualGoals === videoIntervals.filter(c => c.type === 'GOAL').length ? 'Khớp với AI' : `AI đoán: ${videoIntervals.filter(c => c.type === 'GOAL').length}`}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  
                   {isScanningVideo ? (
                     <div className="empty-results">
-                      <span className="radar-icon">📡</span>
-                      <p>AI PITCH ANALYSIS IN PROGRESS</p>
+                      <p>PITCH ANALYSIS IN PROGRESS</p>
                       <div style={{ width: '80%', background: '#0a1d12', height: '10px', borderRadius: '5px', overflow: 'hidden', margin: '15px auto' }}>
                         <div style={{ background: '#22c55e', height: '100%', width: `${scanProgress * 100}%`, transition: 'width 0.3s' }}></div>
                       </div>
@@ -613,7 +820,6 @@ function App() {
                     </div>
                   ) : videoIntervals.length === 0 ? (
                     <div className="empty-results">
-                      <span className="radar-icon">⚽</span>
                       <p>NO HIGHLIGHTS DETECTED</p>
                       <span>YOLO scanned the video but found no events matching goalmouth or shot patterns.</span>
                     </div>
@@ -628,9 +834,9 @@ function App() {
                               className={`det-item ${clip.keep ? 'ball-border' : 'empty-list-text'}`}
                               style={{ display: 'flex', gap: '12px', alignItems: 'center', padding: '10px', background: clip.keep ? 'rgba(8, 20, 14, 0.9)' : 'rgba(20, 20, 20, 0.4)', opacity: clip.keep ? 1 : 0.6 }}
                             >
-                              <div style={{ position: 'relative', cursor: 'pointer' }} onClick={() => handleSeek(clip.start)} title="Click to play from here">
+                              <div style={{ position: 'relative', cursor: 'pointer' }} onClick={() => handlePlayShort(clip.start, clip.end)} title="Click to play segment review">
                                 <img src={clip.thumbnail} alt="Clip Preview" style={{ width: '80px', height: '45px', objectFit: 'cover', borderRadius: '4px', border: '1px solid var(--color-border)' }} />
-                                <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', background: 'rgba(0,0,0,0.6)', borderRadius: '50%', padding: '2px 8px', color: 'white', fontSize: '10px', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>▶</div>
+                                <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', background: 'rgba(0,0,0,0.6)', borderRadius: '50%', width: '20px', height: '20px', color: 'white', fontSize: '9px', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>▶</div>
                               </div>
                               
                               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -644,29 +850,61 @@ function App() {
                                 </div>
                                 <p style={{ fontSize: '0.74rem', color: 'var(--text-secondary)', margin: 0 }}>{clip.description}</p>
                                 
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '4px' }}>
-                                  <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Trim (s):</span>
-                                  <input 
-                                    type="number" 
-                                    value={clip.start} 
-                                    step="0.1"
-                                    onChange={(e) => {
-                                      const val = parseFloat(e.target.value);
-                                      setVideoIntervals(prev => prev.map(c => c.id === clip.id ? { ...c, start: val } : c));
-                                    }}
-                                    style={{ width: '55px', background: '#020205', border: '1px solid var(--color-border)', color: '#fff', fontSize: '0.72rem', padding: '2px' }}
-                                  />
-                                  <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>to</span>
-                                  <input 
-                                    type="number" 
-                                    value={clip.end} 
-                                    step="0.1"
-                                    onChange={(e) => {
-                                      const val = parseFloat(e.target.value);
-                                      setVideoIntervals(prev => prev.map(c => c.id === clip.id ? { ...c, end: val } : c));
-                                    }}
-                                    style={{ width: '55px', background: '#020205', border: '1px solid var(--color-border)', color: '#fff', fontSize: '0.72rem', padding: '2px' }}
-                                  />
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '6px', flexWrap: 'wrap' }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                    <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Trim:</span>
+                                    <input 
+                                      type="number" 
+                                      value={clip.start} 
+                                      step="0.1"
+                                      onChange={(e) => {
+                                        const val = parseFloat(e.target.value);
+                                        setVideoIntervals(prev => prev.map(c => c.id === clip.id ? { ...c, start: val } : c));
+                                      }}
+                                      style={{ width: '50px', background: '#020205', border: '1px solid var(--color-border)', color: '#fff', fontSize: '0.72rem', padding: '2px' }}
+                                    />
+                                    <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>to</span>
+                                    <input 
+                                      type="number" 
+                                      value={clip.end} 
+                                      step="0.1"
+                                      onChange={(e) => {
+                                        const val = parseFloat(e.target.value);
+                                        setVideoIntervals(prev => prev.map(c => c.id === clip.id ? { ...c, end: val } : c));
+                                      }}
+                                      style={{ width: '50px', background: '#020205', border: '1px solid var(--color-border)', color: '#fff', fontSize: '0.72rem', padding: '2px' }}
+                                    />
+                                  </div>
+
+                                  <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '0.72rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                                    <input 
+                                      type="checkbox" 
+                                      checked={clip.correct} 
+                                      onChange={(e) => {
+                                        const checked = e.target.checked;
+                                        setVideoIntervals(prev => prev.map(c => c.id === clip.id ? { ...c, correct: checked } : c));
+                                      }}
+                                    />
+                                    Dự đoán đúng
+                                  </label>
+
+                                  <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '0.72rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                                    <input 
+                                      type="checkbox" 
+                                      checked={clip.isGoal} 
+                                      onChange={(e) => {
+                                        const checked = e.target.checked;
+                                        setVideoIntervals(prev => prev.map(c => {
+                                          if (c.id === clip.id) {
+                                            const isAiGoal = c.type === 'GOAL';
+                                            return { ...c, isGoal: checked, correct: checked === isAiGoal };
+                                          }
+                                          return c;
+                                        }));
+                                      }}
+                                    />
+                                    Có bàn thắng
+                                  </label>
                                 </div>
                               </div>
                               
@@ -749,7 +987,6 @@ function App() {
                     </div>
                   ) : (
                     <div className="empty-results">
-                      <span className="radar-icon">⚽</span>
                       <p>ANALYSIS ENGINE STANDBY</p>
                       <span>Upload a soccer match photo or simulate a preset scenario to view highlight analysis logs.</span>
                     </div>
@@ -826,7 +1063,7 @@ function App() {
 
               {/* RENDER THE INTERACTIVE INJECTED SVG */}
               <div className="svg-viewport-container">
-                <p className="viewport-tip">💡 Interactive Diagram: Click on individual flowchart elements below to inspect their code mechanics.</p>
+                <p className="viewport-tip">Interactive Diagram: Click on individual flowchart elements below to inspect their code mechanics.</p>
                 <div 
                   className="interactive-svg-wrapper"
                   dangerouslySetInnerHTML={{ __html: getSvgContent() }}
@@ -868,7 +1105,6 @@ function App() {
                   </div>
                 ) : (
                   <div className="operator-idle">
-                    <span className="ai-brain-icon">🧠</span>
                     <p>CONSOLE STANDBY</p>
                     <span>Click any element block in the flowchart (like 'Database', 'FastAPI', 'YOLO inference') to analyze its detailed pipeline parameters.</span>
                   </div>

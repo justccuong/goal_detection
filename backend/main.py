@@ -139,6 +139,32 @@ def process_video_background(job_id: str, video_path: str):
     }
     
     try:
+        # Transcode the video first to ensure compatibility (H.264 / AAC MP4)
+        transcoded_filename = f"{job_id}_transcoded.mp4"
+        transcoded_path = os.path.join(UPLOAD_DIR, transcoded_filename)
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-c:v", "libx264",
+            "-preset", "superfast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-strict", "experimental",
+            transcoded_path
+        ]
+        
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0 and os.path.exists(transcoded_path):
+                video_path = transcoded_path
+                jobs[job_id]["video_path"] = transcoded_path
+                print(f"Successfully transcoded {job_id} to standard MP4 H.264")
+            else:
+                print(f"Transcoding failed with code {result.returncode}. Stderr: {result.stderr}. Falling back to original.")
+        except Exception as trans_ex:
+            print(f"Transcoding process error: {trans_ex}. Falling back to original.")
+            
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise Exception("Failed to open video file")
@@ -355,6 +381,19 @@ def status_video(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs[job_id]
+
+@app.get("/api/video/{job_id}")
+def get_video(job_id: str):
+    transcoded_path = os.path.join(UPLOAD_DIR, f"{job_id}_transcoded.mp4")
+    if os.path.exists(transcoded_path):
+        return FileResponse(transcoded_path, media_type="video/mp4")
+        
+    for ext in [".mp4", ".avi", ".mov", ".mkv"]:
+        path = os.path.join(UPLOAD_DIR, f"{job_id}{ext}")
+        if os.path.exists(path):
+            return FileResponse(path, media_type="video/mp4")
+            
+    raise HTTPException(status_code=404, detail="Video file not found")
 
 @app.post("/api/export_video")
 async def export_video(payload: ExportPayload):
