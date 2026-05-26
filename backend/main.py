@@ -21,7 +21,7 @@ app = FastAPI(title="SmartPlay Football Highlight API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -55,6 +55,48 @@ CLASS_MAPPINGS = {
     0: {"name": "Ball", "type": "ball", "color": (0, 255, 255)},        # Neon Yellow-ish (BGR)
     1: {"name": "Goalpost", "type": "goalpost", "color": (255, 255, 0)}, # Cyan (BGR)
 }
+
+def convert_to_h264(input_path: str) -> str:
+    """
+    Convert any uploaded video to H264 MP4 for maximum OpenCV compatibility.
+    Returns path to converted video.
+    """
+
+    converted_path = os.path.splitext(input_path)[0] + "_h264.mp4"
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+
+        # Video codec
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-pix_fmt", "yuv420p",
+
+        # Audio codec
+        "-c:a", "aac",
+
+        # Better compatibility
+        "-movflags", "+faststart",
+
+        converted_path
+    ]
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg conversion failed:\n{result.stderr}")
+
+    if not os.path.exists(converted_path):
+        raise Exception("Converted video was not created")
+
+    return converted_path
 
 def draw_hud_box(img, x1, y1, x2, y2, label, conf, color, is_threat):
     # Draw bounding box outline
@@ -288,8 +330,18 @@ async def upload_video(file: UploadFile = File(...), background_tasks: Backgroun
         with open(video_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        background_tasks.add_task(process_video_background, job_id, video_path)
+        # background_tasks.add_task(process_video_background, job_id, video_path)
         
+        # Convert uploaded video to H264 first
+        converted_video_path = convert_to_h264(video_path)
+
+        # Process converted video
+        background_tasks.add_task(
+            process_video_background,
+            job_id,
+            converted_video_path
+)
+
         return {
             "job_id": job_id,
             "status": "pending",
