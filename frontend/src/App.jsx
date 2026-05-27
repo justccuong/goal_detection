@@ -84,6 +84,16 @@ function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [actualGoals, setActualGoals] = useState(0);
 
+  // Bounded telemetry video & export options states
+  const [playBounded, setPlayBounded] = useState(false);
+  const [boundedStatus, setBoundedStatus] = useState('pending');
+  const [boundedProgress, setBoundedProgress] = useState(0);
+  const [exportOptions, setExportOptions] = useState({
+    markdown: true,
+    clean: true,
+    bounding: true
+  });
+
   // Custom Video Player & Playback Range Bounding States
   const [isPlaying, setIsPlaying] = useState(false);
   const [videoCurrentTime, setVideoCurrentTime] = useState(0);
@@ -392,6 +402,8 @@ function App() {
   };
 
   const pollVideoStatus = (job_id) => {
+    let scanFinished = false;
+    let lastBoundedProgress = -1;
     const timer = setInterval(async () => {
       try {
         const response = await fetch(`http://localhost:8000/api/status_video/${job_id}`);
@@ -401,28 +413,53 @@ function App() {
         
         const data = await response.json();
         
+        if (data.bounded_status) {
+          setBoundedStatus(data.bounded_status);
+          setBoundedProgress(data.bounded_progress || 0);
+        }
+        
         if (data.status === 'processing') {
           const progressPercent = Math.round(data.progress * 100);
           setScanProgress(data.progress);
           addLog(`Scanning video: ${progressPercent}% complete...`, "info");
         } else if (data.status === 'completed') {
-          clearInterval(timer);
-          setScanProgress(1.0);
-          setIsScanningVideo(false);
+          if (!scanFinished) {
+            scanFinished = true;
+            setScanProgress(1.0);
+            setIsScanningVideo(false);
+            
+            const mappedIntervals = data.intervals.map(inter => ({ 
+              ...inter, 
+              keep: true,
+              correct: true,
+              isGoal: inter.type === 'GOAL'
+            }));
+            setVideoIntervals(mappedIntervals);
+            const predictedGoalsCount = data.intervals.filter(c => c.type === 'GOAL').length;
+            setActualGoals(predictedGoalsCount);
+            setVideoUrl(`http://localhost:8000/api/video/${job_id}`);
+            addLog(`Video scanning finished. Extracted ${mappedIntervals.length} soccer highlight clips!`, "success");
+            if (mappedIntervals.length > 0) {
+              playAlert("GOAL");
+            }
+            addLog("Kích hoạt kết xuất video theo dõi YOLOv8 (Bounding Box) trong nền...", "system");
+          }
           
-          const mappedIntervals = data.intervals.map(inter => ({ 
-            ...inter, 
-            keep: true,
-            correct: true,
-            isGoal: inter.type === 'GOAL'
-          }));
-          setVideoIntervals(mappedIntervals);
-          const predictedGoalsCount = data.intervals.filter(c => c.type === 'GOAL').length;
-          setActualGoals(predictedGoalsCount);
-          setVideoUrl(`http://localhost:8000/api/video/${job_id}`);
-          addLog(`Video scanning finished. Extracted ${mappedIntervals.length} soccer highlight clips!`, "success");
-          if (mappedIntervals.length > 0) {
-            playAlert("GOAL");
+          if (data.bounded_status === 'rendering') {
+            const bp = Math.round((data.bounded_progress || 0) * 100);
+            if (bp !== lastBoundedProgress) {
+              lastBoundedProgress = bp;
+              addLog(`Đang kết xuất video Bounding Box trong nền: ${bp}%...`, "system");
+            }
+          }
+          
+          if (data.bounded_status === 'completed' || data.bounded_status === 'failed') {
+            clearInterval(timer);
+            if (data.bounded_status === 'completed') {
+              addLog(`Kết xuất video Bounding Box hoàn tất! Luồng video YOLO hiện đã sẵn sàng.`, "success");
+            } else {
+              addLog(`Kết xuất video Bounding Box thất bại: ${data.bounded_error}`, "error");
+            }
           }
         } else if (data.status === 'failed') {
           clearInterval(timer);
@@ -436,6 +473,34 @@ function App() {
         setErrorMsg(`Polling connection error: ${err.message}`);
       }
     }, 1500);
+  };
+
+  const handleToggleBounded = () => {
+    if (!jobId || boundedStatus !== 'completed') return;
+    const nextPlayBounded = !playBounded;
+    setPlayBounded(nextPlayBounded);
+    
+    if (videoRef.current) {
+      const curTime = videoRef.current.currentTime;
+      const wasPlaying = !videoRef.current.paused;
+      
+      const newUrl = nextPlayBounded 
+        ? `http://localhost:8000/api/video/${jobId}?bounded=true`
+        : `http://localhost:8000/api/video/${jobId}`;
+      
+      videoRef.current.src = newUrl;
+      videoRef.current.load();
+      videoRef.current.currentTime = curTime;
+      
+      if (wasPlaying) {
+        videoRef.current.oncanplay = () => {
+          videoRef.current.play().catch(e => console.warn("Playback blocked", e));
+          videoRef.current.oncanplay = null;
+        };
+      }
+      
+      addLog(`Swapped stream to: ${nextPlayBounded ? "YOLO Bounded" : "Clean original"}`, "info");
+    }
   };
 
   const handleSeek = (time) => {
@@ -495,9 +560,13 @@ function App() {
       setErrorMsg("No highlight clips selected for export.");
       return;
     }
+    if (!exportOptions.markdown && !exportOptions.clean && !exportOptions.bounding) {
+      setErrorMsg("Vui lòng chọn ít nhất một định dạng để xuất.");
+      return;
+    }
     
     setIsExporting(true);
-    addLog(`Initiating highlight compilation for ${selectedClips.length} segments using FFmpeg...`, "system");
+    addLog(`Initiating highlight compilation for ${selectedClips.length} segments...`, "system");
     
     try {
       const response = await fetch("http://localhost:8000/api/export_video", {
@@ -505,7 +574,20 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           job_id: jobId,
-          intervals: selectedClips.map(c => ({ start: parseFloat(c.start), end: parseFloat(c.end) }))
+          intervals: selectedClips.map(c => ({
+            id: parseInt(c.id),
+            start: parseFloat(c.start),
+            end: parseFloat(c.end),
+            type: c.type || "ACTIVE_PLAY",
+            confidence: parseFloat(c.confidence || 0),
+            correct: c.correct,
+            isGoal: c.isGoal,
+            description: c.description || ""
+          })),
+          export_markdown: exportOptions.markdown,
+          export_clean: exportOptions.clean,
+          export_bounding: exportOptions.bounding,
+          actual_goals: parseInt(actualGoals)
         })
       });
       
@@ -515,20 +597,24 @@ function App() {
       
       const blob = await response.blob();
       const isZip = blob.type === 'application/zip';
+      const isMd = blob.type === 'text/markdown' || blob.type.startsWith('text/');
       const url = window.URL.createObjectURL(blob);
       
       const a = document.createElement("a");
       a.href = url;
-      a.download = isZip ? "football_highlights.zip" : "football_highlights.mp4";
+      if (isZip) {
+        a.download = "football_highlights.zip";
+      } else if (isMd) {
+        a.download = `smartplay_highlight_report_${jobId || "export"}.md`;
+      } else {
+        a.download = exportOptions.bounding ? "football_highlights_bounding.mp4" : "football_highlights_clean.mp4";
+      }
       document.body.appendChild(a);
       a.click();
       a.remove();
       
       setIsExporting(false);
-      addLog(isZip ? "FFmpeg highlight segments compilation complete! ZIP downloaded." : "FFmpeg highlight reel compilation complete! Video downloaded.", "success");
-      
-      // Auto download report file
-      downloadReportFile(selectedClips);
+      addLog("Xuất dữ liệu highlights thành công!", "success");
     } catch (err) {
       addLog(`Export failed: ${err.message}`, "error");
       setErrorMsg(`FFmpeg compilation error: ${err.message}`);
@@ -714,6 +800,34 @@ function App() {
                       <div className="player-time-display" style={{ fontFamily: 'monospace', fontSize: '0.78rem', color: '#a1a1aa', minWidth: '85px', textAlign: 'right' }}>
                         {formatTime(videoCurrentTime)} / {formatTime(videoDuration)}
                       </div>
+                      
+                      <button 
+                        className={`telemetry-toggle-btn ${playBounded ? 'active' : ''} ${boundedStatus === 'rendering' ? 'rendering' : ''}`}
+                        onClick={handleToggleBounded}
+                        disabled={boundedStatus !== 'completed'}
+                        style={{
+                          marginLeft: '12px',
+                          background: 'none',
+                          border: '1px solid var(--color-border)',
+                          borderRadius: '4px',
+                          padding: '4px 8px',
+                          color: boundedStatus === 'completed' ? (playBounded ? 'var(--secondary)' : '#a1a1aa') : '#4b5563',
+                          borderColor: boundedStatus === 'completed' ? (playBounded ? 'var(--secondary)' : 'var(--color-border)') : '#27272a',
+                          fontSize: '0.72rem',
+                          fontFamily: 'monospace',
+                          cursor: boundedStatus === 'completed' ? 'pointer' : 'not-allowed',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          boxShadow: playBounded && boundedStatus === 'completed' ? '0 0 8px rgba(6, 182, 212, 0.3)' : 'none',
+                          textShadow: playBounded && boundedStatus === 'completed' ? '0 0 4px rgba(6, 182, 212, 0.4)' : 'none'
+                        }}
+                      >
+                        {boundedStatus === 'pending' && "TELEMETRY: STANDBY"}
+                        {boundedStatus === 'rendering' && `TELEMETRY: RENDERING (${Math.round(boundedProgress * 100)}%)`}
+                        {boundedStatus === 'completed' && (playBounded ? "TELEMETRY: YOLO" : "TELEMETRY: CLEAN")}
+                        {boundedStatus === 'failed' && "TELEMETRY: FAILED"}
+                      </button>
                     </div>
                   </div>
                 ) : (
@@ -921,13 +1035,52 @@ function App() {
                       </div>
                       
                       <div style={{ marginTop: '15px', borderTop: '1px solid rgba(34, 197, 94, 0.1)', paddingTop: '15px' }}>
+                        <div className="export-settings-panel" style={{ marginBottom: '15px', padding: '12px', background: 'rgba(255, 255, 255, 0.02)', border: '1px solid rgba(255, 255, 255, 0.05)', borderRadius: '6px' }}>
+                          <h4 style={{ margin: '0 0 10px 0', fontSize: '0.8rem', color: 'var(--secondary)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>Cấu hình định dạng xuất</h4>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.76rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                              <input 
+                                type="checkbox" 
+                                checked={exportOptions.markdown} 
+                                onChange={(e) => setExportOptions(prev => ({ ...prev, markdown: e.target.checked }))}
+                                style={{ accentColor: 'var(--secondary)' }}
+                              />
+                              Xuất báo cáo chi tiết (.md) - Kết quả đánh giá của bạn
+                            </label>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.76rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                              <input 
+                                type="checkbox" 
+                                checked={exportOptions.clean} 
+                                onChange={(e) => setExportOptions(prev => ({ ...prev, clean: e.target.checked }))}
+                                style={{ accentColor: 'var(--secondary)' }}
+                              />
+                              Xuất video highlights sạch (Không vẽ Bounding Box)
+                            </label>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.76rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                              <input 
+                                type="checkbox" 
+                                checked={exportOptions.bounding} 
+                                onChange={(e) => setExportOptions(prev => ({ ...prev, bounding: e.target.checked }))}
+                                style={{ accentColor: 'var(--secondary)' }}
+                              />
+                              Xuất video highlights có Bounding Box (YOLO v8)
+                            </label>
+                          </div>
+                        </div>
+
                         <button 
                           className="neon-btn" 
                           onClick={exportHighlightReel}
-                          disabled={isExporting || videoIntervals.filter(c => c.keep).length === 0}
+                          disabled={isExporting || videoIntervals.filter(c => c.keep).length === 0 || (!exportOptions.markdown && !exportOptions.clean && !exportOptions.bounding)}
                           style={{ width: '100%' }}
                         >
-                          {isExporting ? "FFMPEG COMPILING REEL..." : "EXPORT SELECTED HIGHLIGHTS (MP4)"}
+                          {isExporting ? "EXPORTING & COMPILING..." : (
+                            !exportOptions.markdown && !exportOptions.clean && !exportOptions.bounding ? "VUI LÒNG CHỌN ĐỊNH DẠNG XUẤT" :
+                            exportOptions.markdown && !exportOptions.clean && !exportOptions.bounding ? "XUẤT BÁO CÁO PHÂN TÍCH (.MD)" :
+                            !exportOptions.markdown && exportOptions.clean && !exportOptions.bounding ? "XUẤT HIGHLIGHTS SẠCH (MP4)" :
+                            !exportOptions.markdown && !exportOptions.clean && exportOptions.bounding ? "XUẤT HIGHLIGHTS BOUNDING BOX (MP4)" :
+                            "XUẤT DỮ LIỆU HIGHLIGHTS (ZIP)"
+                          )}
                         </button>
                         {isExporting && (
                           <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '8px', fontStyle: 'italic' }}>

@@ -7,6 +7,7 @@ import base64
 import uuid
 import shutil
 import subprocess
+import threading
 from typing import List
 from pydantic import BaseModel
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
@@ -15,6 +16,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 import uvicorn
 from highlight_algorithm import analyze_frame_highlight, merge_time_windows
+
+model_lock = threading.Lock()
 
 app = FastAPI(title="SmartPlay Football Highlight API", version="1.0.0")
 
@@ -128,6 +131,172 @@ def draw_hud_box(img, x1, y1, x2, y2, label, conf, color, is_threat):
     cv2.rectangle(img, (tx, ty - text_h - 4), (tx + text_w + 6, ty + baseline), color, -1)
     cv2.putText(img, text, (tx + 3, ty - 2), font, font_scale, (0, 0, 0) if sum(color) > 380 else (255, 255, 255), thickness, cv2.LINE_AA)
 
+def render_bounded_video_segment(video_path: str, start: float, end: float, output_path: str):
+    """
+    Renders a specific segment of the video with bounding boxes on-the-fly.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise Exception("Failed to open original video for segment rendering")
+        
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    start_frame = int(start * fps)
+    end_frame = int(end * fps)
+    
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    
+    temp_segment_raw = output_path + "_raw_seg.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(temp_segment_raw, fourcc, fps, (width, height))
+    
+    current_frame = start_frame
+    try:
+        while current_frame <= end_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            with model_lock:
+                results = model(frame, verbose=False)
+            detections = []
+            for result in results:
+                for box in result.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    if cls_id in CLASS_MAPPINGS:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        detections.append({
+                            "class_id": cls_id,
+                            "confidence": conf,
+                            "bbox": [x1, y1, x2, y2]
+                        })
+                        
+            for det in detections:
+                x1, y1, x2, y2 = det["bbox"]
+                mapping = CLASS_MAPPINGS[det["class_id"]]
+                draw_hud_box(frame, x1, y1, x2, y2, mapping["name"], det["confidence"], mapping["color"], False)
+                
+            writer.write(frame)
+            current_frame += 1
+    finally:
+        cap.release()
+        writer.release()
+        
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", temp_segment_raw,
+        "-ss", str(start),
+        "-to", str(end),
+        "-i", video_path,
+        "-map", "0:v:0",
+        "-map", "1:a?",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-shortest",
+        output_path
+    ]
+    
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if os.path.exists(temp_segment_raw):
+        os.remove(temp_segment_raw)
+        
+    if res.returncode != 0:
+        raise Exception(f"FFmpeg segment transcode/merge failed: {res.stderr}")
+
+def render_bounded_video_background(job_id: str, video_path: str):
+    """
+    Renders a version of the video with bounding boxes in the background.
+    Saves it to: f"{job_id}_bounded.mp4" in the UPLOAD_DIR.
+    """
+    try:
+        jobs[job_id]["bounded_status"] = "rendering"
+        jobs[job_id]["bounded_progress"] = 0.0
+        print(f"Starting bounded video rendering for job {job_id}...")
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise Exception("Failed to open video for bounded rendering")
+            
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        temp_raw_path = os.path.join(UPLOAD_DIR, f"{job_id}_temp_bounded_raw.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(temp_raw_path, fourcc, fps, (width, height))
+        
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            with model_lock:
+                results = model(frame, verbose=False)
+            detections = []
+            for result in results:
+                for box in result.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    if cls_id in CLASS_MAPPINGS:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        detections.append({
+                            "class_id": cls_id,
+                            "confidence": conf,
+                            "bbox": [x1, y1, x2, y2]
+                        })
+            
+            for det in detections:
+                x1, y1, x2, y2 = det["bbox"]
+                mapping = CLASS_MAPPINGS[det["class_id"]]
+                draw_hud_box(frame, x1, y1, x2, y2, mapping["name"], det["confidence"], mapping["color"], False)
+                
+            writer.write(frame)
+            frame_idx += 1
+            
+            if frame_count > 0:
+                jobs[job_id]["bounded_progress"] = frame_idx / frame_count
+                
+        cap.release()
+        writer.release()
+        
+        bounded_final_path = os.path.join(UPLOAD_DIR, f"{job_id}_bounded.mp4")
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", temp_raw_path,
+            "-i", video_path,
+            "-map", "0:v:0",
+            "-map", "1:a?",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-shortest",
+            bounded_final_path
+        ]
+        
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if os.path.exists(temp_raw_path):
+            os.remove(temp_raw_path)
+            
+        if res.returncode == 0 and os.path.exists(bounded_final_path):
+            jobs[job_id]["bounded_status"] = "completed"
+            jobs[job_id]["bounded_progress"] = 1.0
+            jobs[job_id]["bounded_video_path"] = bounded_final_path
+            print(f"Bounded video rendering completed for job {job_id}")
+        else:
+            raise Exception(f"FFmpeg bounded transcode failed: {res.stderr}")
+            
+    except Exception as e:
+        print(f"Bounded rendering failed for {job_id}: {e}")
+        jobs[job_id]["bounded_status"] = "failed"
+        jobs[job_id]["bounded_error"] = str(e)
+
 def process_video_background(job_id: str, video_path: str):
     jobs[job_id] = {
         "status": "processing",
@@ -136,7 +305,10 @@ def process_video_background(job_id: str, video_path: str):
         "duration": 0.0,
         "fps": 0.0,
         "intervals": [],
-        "error": None
+        "error": None,
+        "bounded_status": "pending",
+        "bounded_progress": 0.0,
+        "bounded_error": None
     }
     
     try:
@@ -191,7 +363,8 @@ def process_video_background(job_id: str, video_path: str):
             if frame_idx % sample_interval == 0:
                 current_time = frame_idx / fps
                 
-                results = model(frame, verbose=False)
+                with model_lock:
+                    results = model(frame, verbose=False)
                 detections = []
                 
                 for result in results:
@@ -257,6 +430,9 @@ def process_video_background(job_id: str, video_path: str):
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["progress"] = 1.0
         
+        # Trigger background bounded rendering
+        render_bounded_video_background(job_id, video_path)
+        
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -264,12 +440,22 @@ def process_video_background(job_id: str, video_path: str):
         jobs[job_id]["error"] = str(e)
 
 class IntervalExport(BaseModel):
+    id: int
     start: float
     end: float
+    type: str
+    confidence: float
+    correct: bool
+    isGoal: bool
+    description: str
 
 class ExportPayload(BaseModel):
     job_id: str
     intervals: List[IntervalExport]
+    export_markdown: bool = True
+    export_clean: bool = True
+    export_bounding: bool = True
+    actual_goals: int = 0
 
 @app.get("/api/health")
 def health():
@@ -289,7 +475,8 @@ async def detect(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Invalid image format")
         
         annotated_img = img.copy()
-        results = model(img, verbose=False)
+        with model_lock:
+            results = model(img, verbose=False)
         detections = []
         ball_count = 0
         goalpost_count = 0
@@ -384,7 +571,14 @@ def status_video(job_id: str):
     return jobs[job_id]
 
 @app.get("/api/video/{job_id}")
-def get_video(job_id: str):
+def get_video(job_id: str, bounded: bool = False):
+    if bounded:
+        bounded_path = os.path.join(UPLOAD_DIR, f"{job_id}_bounded.mp4")
+        if os.path.exists(bounded_path):
+            return FileResponse(bounded_path, media_type="video/mp4")
+        else:
+            raise HTTPException(status_code=404, detail="Bounded video not ready yet")
+
     transcoded_path = os.path.join(UPLOAD_DIR, f"{job_id}_transcoded.mp4")
     if os.path.exists(transcoded_path):
         return FileResponse(transcoded_path, media_type="video/mp4")
@@ -395,6 +589,37 @@ def get_video(job_id: str):
             return FileResponse(path, media_type="video/mp4")
             
     raise HTTPException(status_code=404, detail="Video file not found")
+
+def generate_markdown_report(payload: ExportPayload, job_id: str) -> str:
+    import datetime
+    total_clips = len(payload.intervals)
+    correct_clips = sum(1 for c in payload.intervals if c.correct)
+    accuracy_rate = int((correct_clips / total_clips) * 100) if total_clips > 0 else 0
+    ai_goals = sum(1 for c in payload.intervals if c.type == 'GOAL')
+    
+    md_content = f"""# BÁO CÁO PHÂN TÍCH HIGHLIGHT TRẬN ĐẤU
+* **Mã Tiến Trình (Job ID):** {job_id or "N/A"}
+* **Thời Gian Xuất Báo Cáo:** {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+
+## 📊 THỐNG KÊ HIỆU SUẤT MÔ HÌNH
+
+* **Số bàn thắng thực tế (Người dùng xác nhận):** {payload.actual_goals}
+* **Số bàn thắng dự đoán (AI nhận diện):** {ai_goals}
+* **Số phân cảnh AI dự đoán đúng:** {correct_clips}/{total_clips} phân cảnh
+* **Độ chính xác của AI:** {accuracy_rate}%
+
+## 🎞 CHI TIẾT CÁC PHÂN CẢNH ĐÃ XUẤT HIGHLIGHT
+
+| Phân cảnh | Trim (Bắt đầu - Kết thúc) | Nhãn AI | Độ tin cậy (AI Conf) | Đánh giá của Bạn | Xác nhận Bàn thắng | Nội dung chi tiết |
+| :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+"""
+    for clip in payload.intervals:
+        eval_str = "✅ Đúng" if clip.correct else "❌ Sai"
+        goal_str = "⚽ Có" if clip.isGoal else "❌ Không"
+        md_content += f"| #{clip.id + 1} | {clip.start}s - {clip.end}s | {clip.type} | {int(clip.confidence * 100)}% | {eval_str} | {goal_str} | {clip.description} |\n"
+
+    md_content += "\n\n---\n*Báo cáo được tạo tự động bởi hệ thống SmartPlay Football Highlight Analyzer.*"
+    return md_content
 
 @app.post("/api/export_video")
 async def export_video(payload: ExportPayload):
@@ -412,57 +637,99 @@ async def export_video(payload: ExportPayload):
         if not intervals:
             raise HTTPException(status_code=400, detail="No intervals selected for export")
             
+        if not (payload.export_clean or payload.export_bounding or payload.export_markdown):
+            raise HTTPException(status_code=400, detail="Vui lòng chọn ít nhất một định dạng để xuất.")
+            
         export_id = str(uuid.uuid4())
         export_subfolder = os.path.join(OUTPUT_DIR, export_id)
         os.makedirs(export_subfolder, exist_ok=True)
         
-        clip_files = []
+        files_to_export = []
+        
+        # 1. Generate Markdown report
+        if payload.export_markdown:
+            report_text = generate_markdown_report(payload, job_id)
+            report_path = os.path.join(export_subfolder, "report.md")
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(report_text)
+            files_to_export.append((report_path, "report.md"))
+            
+        # 2. Process clips
         for idx, interval in enumerate(intervals):
             start = interval.start
             end = interval.end
             
-            clip_name = f"clip_{idx}.mp4"
-            clip_path = os.path.join(export_subfolder, clip_name)
-            
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(start),
-                "-to", str(end),
-                "-i", video_path,
-                "-c:v", "libx264",
-                "-c:a", "aac",
-                "-avoid_negative_ts", "make_zero",
-                "-fflags", "+genpts",
-                clip_path
-            ]
-            
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if result.returncode != 0:
-                raise Exception(f"Failed to cut segment {start} - {end}: {result.stderr}")
+            # Clean clip
+            if payload.export_clean:
+                clean_name = f"highlight_{interval.id + 1}_clean.mp4"
+                clean_path = os.path.join(export_subfolder, clean_name)
                 
-            clip_files.append(clip_path)
-            
-        if len(clip_files) == 1:
-            output_filename = f"highlight_{export_id}.mp4"
-            output_path = os.path.join(export_subfolder, output_filename)
-            shutil.copy2(clip_files[0], output_path)
-            
-            if not os.path.exists(output_path):
-                raise Exception("Exported file was not created successfully")
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start),
+                    "-to", str(end),
+                    "-i", video_path,
+                    "-c:v", "libx264",
+                    "-c:a", "aac",
+                    "-avoid_negative_ts", "make_zero",
+                    "-fflags", "+genpts",
+                    clean_path
+                ]
                 
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode != 0:
+                    raise Exception(f"Failed to cut clean segment {start} - {end}: {result.stderr}")
+                    
+                files_to_export.append((clean_path, clean_name))
+                
+            # Bounded clip
+            if payload.export_bounding:
+                bounded_name = f"highlight_{interval.id + 1}_bounding.mp4"
+                bounded_path = os.path.join(export_subfolder, bounded_name)
+                
+                # Check if the entire video has been fully rendered with bounds in background
+                if jobs[job_id].get("bounded_status") == "completed" and "bounded_video_path" in jobs[job_id]:
+                    bounded_source_path = jobs[job_id]["bounded_video_path"]
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-ss", str(start),
+                        "-to", str(end),
+                        "-i", bounded_source_path,
+                        "-c:v", "libx264",
+                        "-c:a", "aac",
+                        "-avoid_negative_ts", "make_zero",
+                        "-fflags", "+genpts",
+                        bounded_path
+                    ]
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if result.returncode != 0:
+                        raise Exception(f"Failed to cut bounded segment from pre-rendered video: {result.stderr}")
+                else:
+                    # Telemetry video rendering is not finished yet, render segment on-the-fly
+                    render_bounded_video_segment(video_path, start, end, bounded_path)
+                    
+                files_to_export.append((bounded_path, bounded_name))
+                
+        if len(files_to_export) == 0:
+            raise HTTPException(status_code=400, detail="Không có tệp nào được tạo.")
+            
+        if len(files_to_export) == 1:
+            file_path, archive_name = files_to_export[0]
+            media_type = "video/mp4"
+            if archive_name.endswith(".md"):
+                media_type = "text/markdown"
             return FileResponse(
-                path=output_path,
-                media_type="video/mp4",
-                filename="smartplay_highlights.mp4"
+                path=file_path,
+                media_type=media_type,
+                filename=archive_name
             )
         else:
             zip_filename = f"highlights_{export_id}.zip"
             zip_path = os.path.join(export_subfolder, zip_filename)
             
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for idx, clip in enumerate(clip_files):
-                    arcname = f"highlight_{idx + 1}.mp4"
-                    zipf.write(clip, arcname)
+                for file_path, archive_name in files_to_export:
+                    zipf.write(file_path, archive_name)
                     
             if not os.path.exists(zip_path):
                 raise Exception("Exported ZIP file was not created successfully")
