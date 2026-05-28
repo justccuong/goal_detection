@@ -103,20 +103,20 @@ def convert_to_h264(input_path: str) -> str:
     return converted_path
 
 def draw_hud_box(img, x1, y1, x2, y2, label, conf, color, is_threat):
-    # Draw bounding box outline
-    cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
+    # Draw bounding box outline (increased thickness from 1 to 3)
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
     
-    # Draw corner brackets (HUD Targeting style)
+    # Draw corner brackets (HUD Targeting style - increased thickness from 2 to 3)
     bracket_len = min(20, int((x2 - x1) * 0.2), int((y2 - y1) * 0.2))
     if bracket_len > 2:
-        cv2.line(img, (x1, y1), (x1 + bracket_len, y1), color, 2)
-        cv2.line(img, (x1, y1), (x1, y1 + bracket_len), color, 2)
-        cv2.line(img, (x2, y1), (x2 - bracket_len, y1), color, 2)
-        cv2.line(img, (x2, y1), (x2, y1 + bracket_len), color, 2)
-        cv2.line(img, (x1, y2), (x1 + bracket_len, y2), color, 2)
-        cv2.line(img, (x1, y2), (x1, y2 - bracket_len), color, 2)
-        cv2.line(img, (x2, y2), (x2 - bracket_len, y2), color, 2)
-        cv2.line(img, (x2, y2), (x2, y2 - bracket_len), color, 2)
+        cv2.line(img, (x1, y1), (x1 + bracket_len, y1), color, 3)
+        cv2.line(img, (x1, y1), (x1, y1 + bracket_len), color, 3)
+        cv2.line(img, (x2, y1), (x2 - bracket_len, y1), color, 3)
+        cv2.line(img, (x2, y1), (x2, y1 + bracket_len), color, 3)
+        cv2.line(img, (x1, y2), (x1 + bracket_len, y2), color, 3)
+        cv2.line(img, (x1, y2), (x1, y2 - bracket_len), color, 3)
+        cv2.line(img, (x2, y2), (x2 - bracket_len, y2), color, 3)
+        cv2.line(img, (x2, y2), (x2, y2 - bracket_len), color, 3)
 
     # Draw background for text
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -352,6 +352,26 @@ def process_video_background(job_id: str, video_path: str):
         # Process at 2 frames per second (fps / 2) to keep scanning speed high
         sample_interval = max(1, int(fps / 2))
         
+        # Setup VideoWriter for bounded video rendering in parallel
+        temp_raw_path = os.path.join(UPLOAD_DIR, f"{job_id}_temp_bounded_raw.mp4")
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        
+        writer = None
+        bounded_enabled = False
+        try:
+            writer = cv2.VideoWriter(temp_raw_path, fourcc, fps, (width, height))
+            if writer.isOpened():
+                bounded_enabled = True
+                jobs[job_id]["bounded_status"] = "rendering"
+            else:
+                jobs[job_id]["bounded_status"] = "failed"
+                jobs[job_id]["bounded_error"] = "Failed to open VideoWriter"
+        except Exception as writer_ex:
+            jobs[job_id]["bounded_status"] = "failed"
+            jobs[job_id]["bounded_error"] = str(writer_ex)
+
         highlight_frames = []
         
         frame_idx = 0
@@ -360,26 +380,42 @@ def process_video_background(job_id: str, video_path: str):
             if not ret:
                 break
                 
+            # Run model on every frame to support smooth bounding box rendering
+            with model_lock:
+                results = model(frame, verbose=False)
+            detections = []
+            
+            for result in results:
+                for box in result.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    
+                    if cls_id in CLASS_MAPPINGS:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        detections.append({
+                            "class_id": cls_id,
+                            "confidence": conf,
+                            "bbox": [x1, y1, x2, y2]
+                        })
+            
+            # Draw bounding boxes and write to video stream
+            if bounded_enabled:
+                try:
+                    annotated_frame = frame.copy()
+                    for det in detections:
+                        x1, y1, x2, y2 = det["bbox"]
+                        mapping = CLASS_MAPPINGS[det["class_id"]]
+                        draw_hud_box(annotated_frame, x1, y1, x2, y2, mapping["name"], det["confidence"], mapping["color"], False)
+                    writer.write(annotated_frame)
+                except Exception as write_err:
+                    print(f"Failed to write bounded frame: {write_err}")
+                    bounded_enabled = False
+                    jobs[job_id]["bounded_status"] = "failed"
+                    jobs[job_id]["bounded_error"] = str(write_err)
+
+            # Analyze highlights at sample intervals
             if frame_idx % sample_interval == 0:
                 current_time = frame_idx / fps
-                
-                with model_lock:
-                    results = model(frame, verbose=False)
-                detections = []
-                
-                for result in results:
-                    for box in result.boxes:
-                        cls_id = int(box.cls[0])
-                        conf = float(box.conf[0])
-                        
-                        if cls_id in CLASS_MAPPINGS:
-                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                            detections.append({
-                                "class_id": cls_id,
-                                "confidence": conf,
-                                "bbox": [x1, y1, x2, y2]
-                            })
-                
                 highlight_level, _ = analyze_frame_highlight(detections)
                 if highlight_level in ["GOAL", "NEAR_MISS"]:
                     highlight_frames.append({
@@ -391,10 +427,15 @@ def process_video_background(job_id: str, video_path: str):
                     })
             
             frame_idx += 1
-            jobs[job_id]["progress"] = min(0.99, frame_idx / frame_count)
+            progress_val = min(0.99, frame_idx / frame_count)
+            jobs[job_id]["progress"] = progress_val
+            if bounded_enabled:
+                jobs[job_id]["bounded_progress"] = progress_val
             
         cap.release()
-        
+        if writer is not None:
+            writer.release()
+            
         # Segment clustering using the new algorithm
         intervals = merge_time_windows(highlight_frames, window_duration=8.0, total_duration=duration)
                 
@@ -430,8 +471,40 @@ def process_video_background(job_id: str, video_path: str):
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["progress"] = 1.0
         
-        # Trigger background bounded rendering
-        render_bounded_video_background(job_id, video_path)
+        # Finalize the bounded video using FFmpeg to combine video and audio streams
+        if bounded_enabled:
+            bounded_final_path = os.path.join(UPLOAD_DIR, f"{job_id}_bounded.mp4")
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", temp_raw_path,
+                "-i", video_path,
+                "-map", "0:v:0",
+                "-map", "1:a?",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-shortest",
+                bounded_final_path
+            ]
+            
+            try:
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if os.path.exists(temp_raw_path):
+                    os.remove(temp_raw_path)
+                
+                if res.returncode == 0 and os.path.exists(bounded_final_path):
+                    jobs[job_id]["bounded_status"] = "completed"
+                    jobs[job_id]["bounded_progress"] = 1.0
+                    jobs[job_id]["bounded_video_path"] = bounded_final_path
+                    print(f"Bounded video rendering completed for job {job_id}")
+                else:
+                    print(f"FFmpeg bounded transcode failed: {res.stderr}")
+                    jobs[job_id]["bounded_status"] = "failed"
+                    jobs[job_id]["bounded_error"] = f"FFmpeg failed: {res.stderr}"
+            except Exception as ffmpeg_ex:
+                print(f"FFmpeg bounded transcode exception: {ffmpeg_ex}")
+                jobs[job_id]["bounded_status"] = "failed"
+                jobs[job_id]["bounded_error"] = str(ffmpeg_ex)
         
     except Exception as e:
         import traceback

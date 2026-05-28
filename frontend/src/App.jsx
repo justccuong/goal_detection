@@ -758,7 +758,7 @@ function App() {
                       onLoadedMetadata={handleLoadedMetadata}
                       onPlay={() => setIsPlaying(true)}
                       onPause={() => setIsPlaying(false)}
-                      style={{ maxHeight: '270px', width: '100%' }}
+                      style={{ width: '100%', height: 'auto', maxHeight: '420px' }}
                     />
                     {isScanningVideo && (
                       <div className="scanning-overlay">
@@ -801,33 +801,55 @@ function App() {
                         {formatTime(videoCurrentTime)} / {formatTime(videoDuration)}
                       </div>
                       
-                      <button 
-                        className={`telemetry-toggle-btn ${playBounded ? 'active' : ''} ${boundedStatus === 'rendering' ? 'rendering' : ''}`}
-                        onClick={handleToggleBounded}
-                        disabled={boundedStatus !== 'completed'}
-                        style={{
-                          marginLeft: '12px',
-                          background: 'none',
-                          border: '1px solid var(--color-border)',
-                          borderRadius: '4px',
-                          padding: '4px 8px',
-                          color: boundedStatus === 'completed' ? (playBounded ? 'var(--secondary)' : '#a1a1aa') : '#4b5563',
-                          borderColor: boundedStatus === 'completed' ? (playBounded ? 'var(--secondary)' : 'var(--color-border)') : '#27272a',
-                          fontSize: '0.72rem',
-                          fontFamily: 'monospace',
-                          cursor: boundedStatus === 'completed' ? 'pointer' : 'not-allowed',
+                      <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        marginLeft: '12px',
+                        padding: '2px 8px',
+                        borderRadius: '4px',
+                        background: playBounded && boundedStatus === 'completed' ? 'rgba(6, 182, 212, 0.05)' : 'rgba(255, 255, 255, 0.01)',
+                        border: '1px solid',
+                        borderColor: boundedStatus === 'completed' ? (playBounded ? 'var(--secondary)' : 'var(--color-border)') : '#27272a',
+                        height: '24px',
+                        boxSizing: 'border-box',
+                        boxShadow: playBounded && boundedStatus === 'completed' ? '0 0 8px rgba(6, 182, 212, 0.15)' : 'none',
+                        transition: 'all 0.2s ease-in-out'
+                      }}>
+                        <label style={{
                           display: 'flex',
                           alignItems: 'center',
                           gap: '6px',
-                          boxShadow: playBounded && boundedStatus === 'completed' ? '0 0 8px rgba(6, 182, 212, 0.3)' : 'none',
-                          textShadow: playBounded && boundedStatus === 'completed' ? '0 0 4px rgba(6, 182, 212, 0.4)' : 'none'
-                        }}
-                      >
-                        {boundedStatus === 'pending' && "TELEMETRY: STANDBY"}
-                        {boundedStatus === 'rendering' && `TELEMETRY: RENDERING (${Math.round(boundedProgress * 100)}%)`}
-                        {boundedStatus === 'completed' && (playBounded ? "TELEMETRY: YOLO" : "TELEMETRY: CLEAN")}
-                        {boundedStatus === 'failed' && "TELEMETRY: FAILED"}
-                      </button>
+                          cursor: boundedStatus === 'completed' ? 'pointer' : 'not-allowed',
+                          fontSize: '0.72rem',
+                          fontFamily: 'monospace',
+                          color: boundedStatus === 'completed' ? (playBounded ? 'var(--secondary)' : '#a1a1aa') : '#4b5563',
+                          margin: 0,
+                          userSelect: 'none'
+                        }}>
+                          <input
+                            type="checkbox"
+                            checked={playBounded}
+                            disabled={boundedStatus !== 'completed'}
+                            onChange={handleToggleBounded}
+                            style={{
+                              cursor: boundedStatus === 'completed' ? 'pointer' : 'not-allowed',
+                              accentColor: 'var(--secondary)',
+                              width: '13px',
+                              height: '13px',
+                              margin: 0
+                            }}
+                          />
+                          <span style={{
+                            fontWeight: playBounded && boundedStatus === 'completed' ? 'bold' : 'normal',
+                            textShadow: playBounded && boundedStatus === 'completed' ? '0 0 4px rgba(6, 182, 212, 0.4)' : 'none'
+                          }}>
+                            {boundedStatus === 'pending' && "BBOX (STANDBY)"}
+                            {boundedStatus === 'rendering' && `BBOX (${Math.round(boundedProgress * 100)}%)`}
+                            {boundedStatus === 'completed' && "BBOX"}
+                            {boundedStatus === 'failed' && "BBOX (FAILED)"}
+                          </span>
+                        </label>
+                      </div>
                     </div>
                   </div>
                 ) : (
